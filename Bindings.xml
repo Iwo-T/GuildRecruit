@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="GUILDRECRUIT_NEXT" header="GUILDRECRUIT" category="ADDONS">
+		GuildRecruit_Next()
+	</Binding>
+</Bindings>

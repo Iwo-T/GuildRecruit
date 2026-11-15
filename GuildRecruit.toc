@@ -1,0 +1,14 @@
+## Interface: 16001, 120105
+## Title: GuildRecruit
+## Notes: Finds Danish speakers without a guild in chat and recruits them for your guild, one key press per step: ads, /who checks, whispers and invites. /gr
+## Author: Iwo
+## Version: 1.0.0
+## SavedVariables: GuildRecruitDB
+## OptionalDeps: DevHarness
+
+Danish.lua
+Core.lua
+Texts.lua
+Recruit.lua
+Window.lua
+Commands.lua
