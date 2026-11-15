@@ -20,6 +20,7 @@ local AD_WINDOW = 15 * 60
 local HOUR = 60 * 60
 
 local pendingWho
+local lateKeys = {} -- people whose /who timed out this session: a late answer about them belongs to nobody else
 local whoToken = 0
 local lastWho, lastInvite = -math.huge, -math.huge
 local lastInvitedKey
@@ -41,6 +42,7 @@ local NOT_REFUSALS = { "not in a guild", "not in guild", "no guild", "ingen guil
 	"ikke i et guild", "ikke i nogen guild", "ikke i noget guild", "har ikke en guild", "har ikke et guild",
 	"har ikke nogen guild", "har ikke noget guild", "har ingen guild", "no rush", "no problem", "no worries",
 	"no stress", "ingen stress", "ingen problem", "intet problem" }
+table.sort(NOT_REFUSALS, function(a, b) return #a > #b end)
 local NO_PHRASES = { "ikke interesseret", "not interested", "not for me", "ikke noget for mig", "har en guild",
 	"har et guild", "har guild", "har allerede en guild", "har allerede et guild", "allerede i en guild",
 	"allerede i et guild", "er i en guild", "er i et guild", "m in a guild", "am in a guild", "already in a guild",
@@ -97,25 +99,33 @@ function ns.Answer(text)
 end
 
 -- A whisper asking for a guild invite. A bare "inv" may be about a group, so it counts only shortly after an ad.
+-- The words come from the whole line ("har ingen guild, invite pls" names the guild); the refusal check and the
+-- bare-inv test read it without the not-refusal phrases.
 function ns.IsInviteRequest(text, afterAd)
-	local joined = Clean(text)
-	if Classify(joined) == "no" then
+	local cleaned = Clean(text)
+	if Classify(cleaned) == "no" then
 		return false
 	end
-	local invite, guild, onlyFiller, count = false, false, true, 0
-	for word in joined:gmatch("%S+") do
-		count = count + 1
+	local invite, guild = false, false
+	for _, word in ipairs(ns.Words(text)) do
 		if EXPLICIT[word] then
 			return true
-		elseif INVITE_WORDS[word] then
-			invite = true
-		elseif GUILD_WORDS[word] then
-			guild = true
-		elseif not FILLER[word] then
-			onlyFiller = false
+		end
+		invite, guild = invite or INVITE_WORDS[word] == true, guild or GUILD_WORDS[word] == true
+	end
+	if not invite then
+		return false
+	elseif guild then
+		return true
+	end
+	local count = 0
+	for word in cleaned:gmatch("%S+") do
+		count = count + 1
+		if not FILLER[word] and not INVITE_WORDS[word] then
+			return false
 		end
 	end
-	return invite and (guild or (afterAd and onlyFiller and count <= MAX_BARE_WORDS))
+	return afterAd == true and count <= MAX_BARE_WORDS
 end
 
 local function Earlier(a, b)
@@ -132,14 +142,15 @@ local function Oldest(state)
 	return found
 end
 
--- The candidate without a guild checked longest ago who was never whispered: nobody gets the pitch twice.
-local function OldestUnasked()
-	local found
+-- Candidates without a guild who were never whispered (nobody gets the pitch twice), checked longest ago first.
+local function Unasked()
+	local found = {}
 	for _, person in pairs(ns.db.people) do
-		if person.state == "free" and not person.asked and (not found or Earlier(person, found)) then
-			found = person
+		if person.state == "free" and not person.asked then
+			found[#found + 1] = person
 		end
 	end
+	table.sort(found, Earlier)
 	return found
 end
 
@@ -234,14 +245,23 @@ function ns.NextStep()
 	if not named then
 		notes[#notes + 1] = "the guild's name hasn't loaded yet, so no ad or whisper for a moment."
 	end
-	local free = OldestUnasked()
+	local unasked = Unasked()
+	local free = unasked[1]
 	if free and named and WhisperWait(now) == 0 then
-		local text = ns.Expand(ns.db.whisper, ns.FirstName(free.name))
-		if #text <= ns.MAX_BYTES then
-			return Step(notes, "whisper", "Whisper " .. free.name .. " about the guild", { person = free, text = text })
+		local tooLong
+		for _, person in ipairs(unasked) do
+			local text = ns.Expand(ns.db.whisper, ns.FirstName(person.name))
+			if #text <= ns.MAX_BYTES then
+				if tooLong then
+					notes[#notes + 1] = tooLong
+				end
+				return Step(notes, "whisper", "Whisper " .. person.name .. " about the guild",
+					{ person = person, text = text })
+			end
+			tooLong = tooLong or ("the whisper is too long for %s (%d bytes, a chat message holds %d): /gr whisper "
+				.. "<text> shortens it."):format(person.name, #text, ns.MAX_BYTES)
 		end
-		notes[#notes + 1] = ("the whisper is too long for %s (%d bytes, a chat message holds %d): /gr whisper <text> "
-			.. "shortens it."):format(free.name, #text, ns.MAX_BYTES)
+		notes[#notes + 1] = tooLong
 	end
 	local unjoined, nextAd
 	if named then
@@ -286,6 +306,7 @@ local function Who(person)
 			return
 		end
 		FinishWho()
+		lateKeys[person.key] = true
 		if person.state == "checking" then
 			ns.SetState(person, "new")
 		end
@@ -376,8 +397,25 @@ local function Missed(person, names)
 	end
 end
 
--- An exact-name /who answers with that one player, perhaps spelled otherwise ("Bjorn" for "Bjørn"), or with nobody
--- when they're offline. Other names mean someone else's /who answered, or a name format GuildRecruit doesn't know.
+-- Letters another spelling of a name may write in ASCII ("Bjorn" for "Bjørn"), both cases.
+local FOLD = {
+	["\195\134"] = "ae", ["\195\166"] = "ae", ["\195\152"] = "o", ["\195\184"] = "o", ["\195\133"] = "a",
+	["\195\165"] = "a", ["\195\132"] = "a", ["\195\164"] = "a", ["\195\150"] = "o", ["\195\182"] = "o",
+	["\195\156"] = "u", ["\195\188"] = "u", ["\195\137"] = "e", ["\195\169"] = "e",
+}
+
+local function Folded(key)
+	return (key:gsub("\195[\128-\191]", function(letter) return FOLD[letter] or letter end):lower())
+end
+
+-- Another spelling of the same name: a realm after it, or æ/ø/å written in ASCII.
+local function SameName(theirKey, key)
+	return theirKey:sub(1, #key) == key or Folded(theirKey) == Folded(key)
+end
+
+-- An exact-name /who answers with that player alone, perhaps spelled otherwise, or with nobody when they're
+-- offline. A /who that timed out may still answer late; any other name is the player's own /who, or a name format
+-- GuildRecruit doesn't know.
 ns.On("WHO_LIST_UPDATE", function()
 	if not pendingWho then
 		return
@@ -393,21 +431,23 @@ ns.On("WHO_LIST_UPDATE", function()
 		end
 	end
 	ns.Log("who answer", count, table.concat(names, ", "))
-	FinishWho()
-	if not person then
-		return
-	end
 	for _, info in ipairs(readable) do
-		if ns.Key(info.fullName) == key then
-			return Checked(person, info)
+		local theirKey = ns.Key(info.fullName)
+		if theirKey == key then
+			FinishWho()
+			return person and Checked(person, info)
+		elseif lateKeys[theirKey] then
+			lateKeys[theirKey] = nil
+			return
 		end
 	end
-	if person.state ~= "checking" then
+	FinishWho()
+	if not person or person.state ~= "checking" then
 		return
 	elseif count == 0 then
 		ns.SetState(person, "offline")
 		ns.Print(person.name .. " isn't online any more.")
-	elseif count == 1 and readable[1] then
+	elseif count == 1 and readable[1] and SameName(ns.Key(readable[1].fullName), key) then
 		Checked(person, readable[1])
 	else
 		Missed(person, table.concat(names, ", "))

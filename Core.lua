@@ -22,7 +22,7 @@ local OPEN = { new = true, checking = true, free = true }
 
 local eventFrame = CreateFrame("Frame")
 local handlers = {}
-local heard = {} -- this session's language evidence per person key: { strong, weak, at }
+local heard = {} -- this session's language evidence per person key: { start, strong, weak }
 ns.byGuid = {}
 
 function ns.On(event, fn)
