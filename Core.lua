@@ -2,11 +2,15 @@ local addonName, ns = ...
 
 ns.SCHEMA = 1
 
+local DEFAULTS_VERSION = 2
 local MAX_PEOPLE = 2000
 local HEARD_WINDOW = 30 * 60
 local MAX_HEARD = 500
 local SAID_BYTES = 200
 local GUILDED_RECHECK = 7 * 24 * 60 * 60
+local TALKED_KEPT = 30 * 24 * 60 * 60
+-- A /who's "no guild" is trusted this long; then they get checked again before anyone pitches them.
+ns.FREE_FOR = 3 * 60 * 60
 local STAFF_FLAGS = { GM = true, DEV = true }
 
 -- Chat that can turn up a Danish speaker, and what to call where they spoke; channel lines use the channel's name.
@@ -52,6 +56,32 @@ end
 
 function ns.Now()
 	return GetServerTime()
+end
+
+local lastTold = {}
+
+-- Says something at most once per `every` seconds, so a press in a macro used all the time doesn't flood chat.
+function ns.Tell(text, every)
+	local clock = GetTime()
+	if not lastTold[text] or clock - lastTold[text] >= every then
+		lastTold[text] = clock
+		ns.Print(text)
+	end
+end
+
+-- During encounters the client hides chat payloads from addons (SecretInChatMessagingLockdown) and blocks macro chat,
+-- so nothing goes out then whose answer couldn't be read.
+function ns.ChatLocked()
+	return C_ChatInfo.InChatMessagingLockdown ~= nil and C_ChatInfo.InChatMessagingLockdown() == true
+end
+
+-- Someone who whispered the player is talking to them already, in whatever language: theirs, not GuildRecruit's.
+function ns.Talked(key)
+	return ns.db.talked[key] ~= nil
+end
+
+function ns.StaleFree(person, now)
+	return person.state == "free" and now - person.at > ns.FREE_FOR
 end
 
 -- Chat says "First Surname", /who may say "First-Surname": people are keyed without case, spaces or hyphens.
@@ -141,7 +171,7 @@ local function Evidence(key, now)
 			ForgetOldEvidence(now)
 		end
 	end
-	evidence = { start = now, strong = { 0, 0, 0 }, weak = { 0, 0, 0 } }
+	evidence = { start = now, strong = ns.NewScore(), weak = ns.NewScore() }
 	heard[key] = evidence
 	return evidence
 end
@@ -162,7 +192,7 @@ function ns.Hear(name, guid, text, where)
 		return
 	end
 	person = person or ns.AddPerson(name, guid)
-	if not OPEN[person.state] then
+	if not OPEN[person.state] or ns.StaleFree(person, now) then
 		ns.SetState(person, "new")
 	end
 	person.said, person.where = ns.Cut(ns.Plain(text), SAID_BYTES), where
@@ -213,13 +243,39 @@ end
 
 ns.On("UPDATE_MOUSEOVER_UNIT", function() Sighted("mouseover") end)
 ns.On("PLAYER_TARGET_CHANGED", function() Sighted("target") end)
+ns.On("NAME_PLATE_UNIT_ADDED", Sighted)
 
 local function Defaults()
 	return {
-		schema = ns.SCHEMA, people = {}, seq = 0, ads = CopyTable(ns.DEFAULT_ADS), whisper = ns.DEFAULT_WHISPER,
-		channels = CopyTable(ns.DEFAULT_CHANNELS), adMinutes = ns.DEFAULT_AD_MINUTES, nextAd = 1, lastAd = {},
-		lastAdAny = 0, whispers = {}, watching = true, stats = { ads = 0, whispered = 0, invited = 0, joined = 0 },
+		schema = ns.SCHEMA, defaults = DEFAULTS_VERSION, people = {}, seq = 0, ads = CopyTable(ns.DEFAULT_ADS),
+		whisper = ns.DEFAULT_WHISPER, channels = CopyTable(ns.DEFAULT_CHANNELS), adMinutes = ns.DEFAULT_AD_MINUTES,
+		nextAdFor = {}, lastAd = {}, lastAdAny = 0, whispers = {}, talked = {}, watching = true, autoWhisper = true,
+		stats = { ads = 0, whispered = 0, invited = 0, joined = 0 },
 	}
+end
+
+-- Version 1's defaults were ads in LookingForGroup alone every 15 minutes. A save still holding exactly those gets
+-- the new ones; settings the player chose stay.
+local function UpdateDefaults(db)
+	if (db.defaults or 1) >= DEFAULTS_VERSION then
+		return
+	end
+	if type(db.channels) == "table" and #db.channels == 1 and db.channels[1] == "LookingForGroup" then
+		db.channels = CopyTable(ns.DEFAULT_CHANNELS)
+	end
+	if db.adMinutes == 15 then
+		db.adMinutes = ns.DEFAULT_AD_MINUTES
+	end
+	db.nextAd = nil
+	db.defaults = DEFAULTS_VERSION
+end
+
+local function ForgetOldTalkers(db, now)
+	for key, at in pairs(db.talked) do
+		if now - at > TALKED_KEPT then
+			db.talked[key] = nil
+		end
+	end
 end
 
 -- Over the cap, people never contacted go first, those heard from longest ago first: forgetting whom GuildRecruit
@@ -254,6 +310,7 @@ local function LoadDB()
 		db = Defaults()
 		db.people = people
 	end
+	UpdateDefaults(db)
 	for key, value in pairs(Defaults()) do
 		if db[key] == nil then
 			db[key] = value
@@ -261,6 +318,7 @@ local function LoadDB()
 	end
 	GuildRecruitDB, ns.db = db, db
 	Prune(db)
+	ForgetOldTalkers(db, ns.Now())
 	for key, person in pairs(db.people) do
 		if person.state == "checking" then
 			person.state = "new"
@@ -282,6 +340,7 @@ ns.On("PLAYER_LOGIN", function()
 	ns.playerGUID = UnitGUID("player")
 	if ns.firstRun then
 		ns.Print("listening for Danish speakers. Bind Key Bindings > AddOns > GuildRecruit > Next recruiting step "
-			.. "(or make a /gr next macro): each press does one step. /gr show opens the window, /gr lists the commands.")
+			.. "(or make a /gr next macro): each press posts the due ads, checks a candidate and invites who asked; "
+			.. "whispers go out on their own. /gr show opens the window, /gr lists the commands.")
 	end
 end)

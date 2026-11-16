@@ -1,8 +1,8 @@
 ## Interface: 16001, 120105
 ## Title: GuildRecruit
-## Notes: Finds Danish speakers without a guild in chat and recruits them for your guild, one key press per step: ads, /who checks, whispers and invites. /gr
+## Notes: Recruits for your guild: posts ads in General and LookingForGroup, finds Danish speakers without a guild and whispers them; one key press does the due ads, /who and invites. /gr
 ## Author: Iwo
-## Version: 1.0.0
+## Version: 1.1.0
 ## SavedVariables: GuildRecruitDB
 ## OptionalDeps: DevHarness
 

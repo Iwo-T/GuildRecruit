@@ -4,7 +4,7 @@ local _, ns = ...
 -- up ads and whispers, and the rows list the people in play, the ones that need the player first.
 local ROWS = 6
 local ROW_HEIGHT = 16
-local WIDTH = 360
+local WIDTH = 440
 local REFRESH_SECONDS = 1
 local RECENT = 24 * 60 * 60
 local FRESH = 60 * 60
@@ -51,6 +51,9 @@ function ns.DescribePerson(person)
 		parts[#parts + 1] = "level " .. person.level
 	end
 	parts[#parts + 1] = STATE_TEXT[person.state] or person.state
+	if person.state == "free" and ns.Talked(person.key) then
+		parts[#parts + 1] = "whispered you"
+	end
 	if person.where then
 		parts[#parts + 1] = person.where
 	end
@@ -62,7 +65,8 @@ function ns.StatusLine()
 	local sent, most = ns.WhispersThisHour()
 	local ads = #db.channels > 0 and #db.ads > 0
 		and ("ads every %d min in %s"):format(db.adMinutes, table.concat(db.channels, ", ")) or "no ads"
-	return ("%s; whispers this hour %d/%d; %d joined so far"):format(ads, sent, most, db.stats.joined)
+	return ("%s; whispers %s, %d/%d this hour; %d joined so far"):format(ads,
+		db.autoWhisper and "on their own" or "on a press", sent, most, db.stats.joined)
 end
 
 local function ShowTooltip(row)

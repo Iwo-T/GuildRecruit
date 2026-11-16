@@ -1,10 +1,10 @@
 local _, ns = ...
 
--- One key press, one recruiting step (GuildRecruit_Next: the key binding, the window's button or /gr next). The
--- client wants a key press or click for channel posts, /who and guild invites, so nothing here sends those on its
--- own; whispers don't need one but go out on a press too, so every message the player sends is one they chose.
--- Each press takes the first of: invite someone who asked, whisper a checked Danish speaker without a guild, post
--- a due ad, /who the newest Danish speaker.
+-- The client wants a key press or click for channel posts, /who and guild invites, so those go out only on a press
+-- (GuildRecruit_Next: the key binding, the window's button, /gr next or a macro). One press does all that's due: the
+-- invite someone asked for, an ad in every channel whose interval has passed, and a /who of the newest Danish
+-- speaker. Whispers need no press: a candidate the /who found without a guild is whispered on its own, within the
+-- rate limit, unless /gr auto off puts whispers back on the press.
 
 local WHO_TIMEOUT = 6
 local WHO_GAP = 5
@@ -18,8 +18,12 @@ local REFUSAL_SECONDS = 5
 local FRESH = 60 * 60
 local AD_WINDOW = 15 * 60
 local HOUR = 60 * 60
+local NAME_RETRY = 5
+local LOGIN_DELAY = 10
+local NOTE_REPEAT = 5 * 60
 
 local pendingWho
+local whisperScheduled = false
 local lateKeys = {} -- people whose /who timed out this session: a late answer about them belongs to nobody else
 local whoToken = 0
 local lastWho, lastInvite = -math.huge, -math.huge
@@ -143,10 +147,12 @@ local function Oldest(state)
 end
 
 -- Candidates without a guild who were never whispered (nobody gets the pitch twice), checked longest ago first.
+-- Left out: whoever whispered the player first (ns.Talked), and a "no guild" too old to trust.
 local function Unasked()
-	local found = {}
+	local found, now = {}, ns.Now()
 	for _, person in pairs(ns.db.people) do
-		if person.state == "free" and not person.asked then
+		if person.state == "free" and not person.asked and not ns.Talked(person.key)
+				and not ns.StaleFree(person, now) then
 			found[#found + 1] = person
 		end
 	end
@@ -200,13 +206,13 @@ local function Duration(seconds)
 	return ("%d min"):format(math.ceil(seconds / 60))
 end
 
-local function WaitLabel(now, free, nextAd)
+local function WaitLabel(now, nextAd)
 	local parts = {}
 	if pendingWho then
 		local person = ns.db.people[pendingWho.key]
 		parts[#parts + 1] = "waiting for the /who on " .. (person and person.name or "someone")
 	end
-	if free and WhisperWait(now) > 0 then
+	if not ns.db.autoWhisper and Unasked()[1] and WhisperWait(now) > 0 then
 		parts[#parts + 1] = "next whisper in " .. Duration(WhisperWait(now))
 	end
 	if nextAd then
@@ -218,66 +224,121 @@ local function WaitLabel(now, free, nextAd)
 	return "Nothing to do now: " .. table.concat(parts, ", ")
 end
 
-local function Step(notes, kind, label, fields)
-	local step = fields or {}
-	step.kind, step.label = kind, label
-	if #notes > 0 then
-		step.note = table.concat(notes, " ")
+-- "a", "a and b", "a, b and c".
+local function Join(items)
+	if #items <= 1 then
+		return items[1] or ""
 	end
-	return step
+	return table.concat(items, ", ", 1, #items - 1) .. " and " .. items[#items]
 end
 
--- What the next press does, without doing it: { kind, label, person, text, channel, slot, note, unjoined }. A step
--- that can't go out (no invite right, a text too long for this guild's name) leaves a note and yields to the next.
-function ns.NextStep()
-	if not IsInGuild() then
-		return Step({}, "none", "You're not in a guild, so there's nothing to recruit for")
+local function TooLongFor(person, text)
+	return ("the whisper is too long for %s (%d bytes, a chat message holds %d): /gr whispertext <text> shortens it.")
+		:format(person.name, #text, ns.MAX_BYTES)
+end
+
+-- The first never-whispered candidate without a guild whose whisper fits, its text, and those it doesn't fit.
+local function NextWhisper()
+	local skipped = {}
+	for _, person in ipairs(Unasked()) do
+		local text = ns.Expand(ns.db.whisper, ns.FirstName(person.name))
+		if #text <= ns.MAX_BYTES then
+			return person, text, skipped
+		end
+		skipped[#skipped + 1] = { person = person, text = text }
 	end
-	local now, clock, notes = ns.Now(), GetTime(), {}
+	return nil, nil, skipped
+end
+
+-- Each candidate the whisper doesn't fit is named once, not on every try.
+local function NameTooLong(skipped)
+	for _, entry in ipairs(skipped) do
+		if not entry.person.tooLong then
+			entry.person.tooLong = true
+			ns.Print(TooLongFor(entry.person, entry.text))
+		end
+	end
+end
+
+local function Add(step, label, action)
+	step.labels[#step.labels + 1] = label
+	step.actions[#step.actions + 1] = action
+end
+
+local function AddInvite(step, clock)
 	local wants = Oldest("wants")
 	if wants and not CanGuildInvite() then
-		notes[#notes + 1] = wants.name .. " wants an invite, but your guild rank can't invite: ask an officer to "
-			.. "/ginvite them."
+		step.notes[#step.notes + 1] = wants.name .. " wants an invite, but your guild rank can't invite: ask an "
+			.. "officer to /ginvite them."
 	elseif wants and clock - lastInvite >= INVITE_GAP then
-		return Step(notes, "invite", "Invite " .. wants.name .. " to the guild", { person = wants })
+		Add(step, "invite " .. wants.name, { kind = "invite", person = wants })
 	end
-	local named = ns.GuildTag() ~= nil
-	if not named then
-		notes[#notes + 1] = "the guild's name hasn't loaded yet, so no ad or whisper for a moment."
+end
+
+local function AddWhisper(step, now)
+	if WhisperWait(now) > 0 or ns.ChatLocked() then
+		return
 	end
-	local unasked = Unasked()
-	local free = unasked[1]
-	if free and named and WhisperWait(now) == 0 then
-		local tooLong
-		for _, person in ipairs(unasked) do
-			local text = ns.Expand(ns.db.whisper, ns.FirstName(person.name))
-			if #text <= ns.MAX_BYTES then
-				if tooLong then
-					notes[#notes + 1] = tooLong
-				end
-				return Step(notes, "whisper", "Whisper " .. person.name .. " about the guild",
-					{ person = person, text = text })
-			end
-			tooLong = tooLong or ("the whisper is too long for %s (%d bytes, a chat message holds %d): /gr whisper "
-				.. "<text> shortens it."):format(person.name, #text, ns.MAX_BYTES)
+	local person, text, skipped = NextWhisper()
+	step.skipped = skipped
+	if person then
+		Add(step, "whisper " .. person.name, { kind = "whisper", person = person, text = text })
+	end
+end
+
+local function AddAds(step, now)
+	local due, unjoined, nextAd = ns.DueAds(now)
+	step.unjoined = unjoined
+	if #due > 0 and ns.ChatLocked() then
+		step.notes[#step.notes + 1] = "chat is locked during this fight, so the ads wait for the next press after it."
+	elseif #due > 0 and ns.AnyAdFits() then
+		local keys = {}
+		for i, ad in ipairs(due) do
+			keys[i] = ad.key
 		end
-		notes[#notes + 1] = tooLong
+		Add(step, (#due == 1 and "an ad in " or "ads in ") .. Join(keys), { kind = "ads", due = due })
+	elseif #due > 0 then
+		step.notes[#step.notes + 1] = "every ad text is too long once this guild's name is filled in: /gr ads shows "
+			.. "their sizes."
 	end
-	local unjoined, nextAd
-	if named then
-		local channel, slot
-		channel, slot, unjoined, nextAd = ns.DueAd(now)
-		if channel and ns.AnyAdFits() then
-			return Step(notes, "ad", "Post an ad in " .. channel, { channel = channel, slot = slot })
-		elseif channel then
-			notes[#notes + 1] = "every ad text is too long once this guild's name is filled in: /gr ads shows their sizes."
-		end
-	end
+	return nextAd
+end
+
+local function AddWho(step, now, clock)
 	local candidate = NewestFresh(now)
 	if candidate and not pendingWho and clock - lastWho >= WHO_GAP then
-		return Step(notes, "who", "Check " .. candidate.name .. " (/who)", { person = candidate })
+		Add(step, "/who " .. candidate.name, { kind = "who", person = candidate })
 	end
-	return Step(notes, "wait", WaitLabel(now, free, nextAd), { unjoined = unjoined })
+end
+
+-- What the next press does, without doing it: { kind = "press" | "wait" | "none", label, actions, notes, skipped,
+-- unjoined }. Actions: invite, whisper (with /gr auto off), ads (every due channel), who. What can't go out (no
+-- invite right, the guild's name not loaded yet, texts too long) leaves a note, and the rest still goes.
+function ns.NextStep()
+	if not IsInGuild() then
+		return { kind = "none", label = "You're not in a guild, so there's nothing to recruit for", actions = {},
+			notes = {} }
+	end
+	local now, clock = ns.Now(), GetTime()
+	local step = { kind = "press", actions = {}, labels = {}, notes = {} }
+	AddInvite(step, clock)
+	local nextAd
+	if ns.GuildTag() then
+		if not ns.db.autoWhisper then
+			AddWhisper(step, now)
+		end
+		nextAd = AddAds(step, now)
+	else
+		step.notes[#step.notes + 1] = "the guild's name hasn't loaded yet, so no ad or whisper for a moment."
+	end
+	AddWho(step, now, clock)
+	if #step.actions == 0 then
+		step.kind, step.label = "wait", WaitLabel(now, nextAd)
+	else
+		local label = Join(step.labels)
+		step.label = label:sub(1, 1):upper() .. label:sub(2)
+	end
+	return step
 end
 
 local function RestoreWhoSetting()
@@ -315,13 +376,59 @@ local function Who(person)
 	end)
 end
 
-local function Whisper(person, text)
+-- States a whisper doesn't move back to asked: an invite they asked for, or one they got.
+local PAST_ASKING = { wants = true, invited = true, joined = true }
+
+function ns.Whisper(person, text)
 	local now = ns.Now()
 	C_ChatInfo.SendChatMessage(text, "WHISPER", nil, person.name)
 	table.insert(ns.db.whispers, now)
 	person.asked = now
-	ns.SetState(person, "asked")
+	if not PAST_ASKING[person.state] then
+		ns.SetState(person, "asked")
+	end
 	ns.db.stats.whispered = ns.db.stats.whispered + 1
+	ns.Log("whisper", person.name)
+end
+
+local function ScheduleWhisper(delay)
+	if whisperScheduled then
+		return
+	end
+	whisperScheduled = true
+	C_Timer.After(math.max(1, delay), function()
+		whisperScheduled = false
+		ns.AutoWhisper()
+	end)
+end
+
+-- Whispers the next checked candidate without a guild as soon as the rate limit allows, and keeps going while
+-- others wait.
+function ns.AutoWhisper()
+	if not ns.db or not ns.db.autoWhisper or not IsInGuild() then
+		return
+	end
+	if not ns.GuildTag() or ns.ChatLocked() then
+		if Unasked()[1] then
+			ScheduleWhisper(ns.ChatLocked() and WHISPER_GAP or NAME_RETRY)
+		end
+		return
+	end
+	local person, text, skipped = NextWhisper()
+	NameTooLong(skipped)
+	if not person then
+		return
+	end
+	local wait = WhisperWait(ns.Now())
+	if wait > 0 then
+		ScheduleWhisper(wait)
+		return
+	end
+	ns.Whisper(person, text)
+	ns.Print(("whispered %s about the guild."):format(person.name))
+	if NextWhisper() then
+		ScheduleWhisper(WHISPER_GAP)
+	end
 end
 
 function ns.Invite(person)
@@ -333,39 +440,60 @@ function ns.Invite(person)
 	ns.Log("invite", person.name)
 end
 
-local function PrintUnjoined(unjoined)
-	for _, key in ipairs(unjoined or {}) do
-		ns.Print(("not in the %s channel on this character, so no ad there (/join %s; Trade channels need a city)."):
-			format(key, key))
+local function Perform(action)
+	if action.kind == "invite" then
+		ns.Invite(action.person)
+	elseif action.kind == "whisper" then
+		ns.Whisper(action.person, action.text)
+	elseif action.kind == "ads" then
+		for _, ad in ipairs(action.due) do
+			ns.PostAd(ad.key, ad.slot, ad.position)
+		end
+	elseif action.kind == "who" then
+		Who(action.person)
 	end
 end
 
-function ns.DoNext()
+-- Inside an instance General and the city channels aren't there to join, so missing them needs no advice.
+local function TellUnjoined(unjoined)
+	if IsInInstance() then
+		return
+	end
+	for _, key in ipairs(unjoined or {}) do
+		ns.Tell(("not in the %s channel on this character, so no ad there (/join %s; Trade channels need a city).")
+			:format(key, key), NOTE_REPEAT)
+	end
+end
+
+-- One press. `quiet` (/gr next quiet, for a macro pressed all the time) leaves out "nothing to do now". A press also
+-- restarts automatic whispers a dead end stopped (the guild unknown at login, a text that fit nobody).
+function ns.DoNext(quiet)
 	if not ns.db then
 		return
 	end
 	local step = ns.NextStep()
-	if step.note then
-		ns.Print(step.note)
+	for _, note in ipairs(step.notes) do
+		ns.Tell(note, NOTE_REPEAT)
 	end
-	if step.kind == "invite" then
-		ns.Invite(step.person)
-	elseif step.kind == "whisper" then
-		Whisper(step.person, step.text)
-	elseif step.kind == "ad" then
-		ns.PostAd(step.channel, step.slot)
-	elseif step.kind == "who" then
-		Who(step.person)
-	else
+	TellUnjoined(step.unjoined)
+	NameTooLong(step.skipped or {})
+	for _, action in ipairs(step.actions) do
+		Perform(action)
+	end
+	if #step.actions == 0 and not quiet then
 		ns.Print(step.label .. ".")
-		PrintUnjoined(step.unjoined)
 	end
+	ns.AutoWhisper()
 	ns.Changed()
 end
 
-GuildRecruit_Next = ns.DoNext
+GuildRecruit_Next = function() ns.DoNext() end
 BINDING_HEADER_GUILDRECRUIT = "GuildRecruit"
 BINDING_NAME_GUILDRECRUIT_NEXT = "Next recruiting step"
+
+ns.On("PLAYER_LOGIN", function()
+	ScheduleWhisper(LOGIN_DELAY)
+end)
 
 -- The facts of a /who answer always count; the state only if nothing (a skip, an invite request) came first.
 local function Checked(person, info)
@@ -381,7 +509,8 @@ local function Checked(person, info)
 		ns.SetState(person, "asked")
 	else
 		ns.SetState(person, "free")
-		ns.Print(("%s (level %d) has no guild: the next press whispers them."):format(person.name, info.level))
+		ns.Print(("%s (level %d) has no guild."):format(person.name, info.level))
+		ns.AutoWhisper()
 	end
 end
 
@@ -454,11 +583,20 @@ ns.On("WHO_LIST_UPDATE", function()
 	end
 end)
 
+-- The invite is the one step that waits for the player, so it rings and shows mid-screen like a raid warning.
+local function Alert(text)
+	ns.Print(text)
+	PlaySound(SOUNDKIT.RAID_WARNING)
+	if RaidWarningUtil and RaidWarningUtil.AddMessage then
+		RaidWarningUtil.AddMessage("GuildRecruit: " .. text, ChatTypeInfo.RAID_WARNING)
+	end
+end
+
 local function Wants(person, text)
 	person.said = ns.Cut(ns.Plain(text), 200)
 	ns.SetState(person, "wants")
 	local key = GetBindingKey("GUILDRECRUIT_NEXT")
-	ns.Print(("%s wants to join: %s invites them."):format(person.name, key and ("press " .. key) or "/gr next"))
+	Alert(("%s wants to join: %s invites them."):format(person.name, key and ("press " .. key) or "/gr next"))
 end
 
 local function OnReply(person, text)
@@ -481,6 +619,7 @@ ns.On("CHAT_MSG_WHISPER", function(text, sender, _, _, _, flags, _, _, _, _, _, 
 			or sender == "" or guid == ns.playerGUID or not IsInGuild() or ns.IsGuildMember(sender) then
 		return
 	end
+	ns.db.talked[ns.Key(sender)] = ns.Now()
 	local person = ns.db.people[ns.Key(sender)]
 	if person and person.state == "asked" and ns.Now() - (person.asked or 0) <= REPLY_WINDOW then
 		OnReply(person, text)

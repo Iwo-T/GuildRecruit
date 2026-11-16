@@ -2,9 +2,9 @@ local _, ns = ...
 
 -- A chat message holds 255 bytes of UTF-8; æ, ø and å take two each.
 ns.MAX_BYTES = 255
-ns.DEFAULT_AD_MINUTES = 15
-ns.MIN_AD_MINUTES, ns.MAX_AD_MINUTES = 5, 120
-ns.DEFAULT_CHANNELS = { "LookingForGroup" }
+ns.DEFAULT_AD_MINUTES = 5
+ns.MIN_AD_MINUTES, ns.MAX_AD_MINUTES = 1, 120
+ns.DEFAULT_CHANNELS = { "General", "LookingForGroup" }
 
 -- {guild} becomes "<Guild Name>", {name} the player's first name. They say only what the guild told us is true.
 ns.DEFAULT_ADS = {
@@ -85,8 +85,21 @@ function ns.ChannelSlot(key)
 	end
 end
 
-ns.On("CHAT_MSG_CHANNEL", function(_, _, _, _, _, _, zoneChannelID, channelIndex, channelBaseName)
-	if not ns.Readable(zoneChannelID, channelIndex, channelBaseName) or type(channelIndex) ~= "number" then
+local NOTE_REPEAT = 5 * 60
+local posted = {} -- channel slot -> { text, key } of the last ad there, until the server echoes it back
+
+-- The server echoes the player's own channel lines: an ad seen again went out, which shows in the DevHarness log
+-- whether one press got every ad through.
+local function Echoed(text, channelIndex, guid)
+	local ad = posted[channelIndex]
+	if guid == ns.playerGUID and ad and ad.text == text then
+		ns.Log("ad seen", ad.key)
+		posted[channelIndex] = nil
+	end
+end
+
+ns.On("CHAT_MSG_CHANNEL", function(text, _, _, _, _, _, zoneChannelID, channelIndex, channelBaseName, _, _, guid)
+	if not ns.Readable(text, zoneChannelID, channelIndex, channelBaseName, guid) or type(channelIndex) ~= "number" then
 		return
 	end
 	if type(channelBaseName) == "string" and channelBaseName ~= "" then
@@ -95,29 +108,31 @@ ns.On("CHAT_MSG_CHANNEL", function(_, _, _, _, _, _, zoneChannelID, channelIndex
 	if type(zoneChannelID) == "number" and zoneChannelID > 0 then
 		seenSlots[zoneChannelID] = channelIndex
 	end
+	Echoed(text, channelIndex, guid)
 end)
 
--- The first configured channel whose interval has passed and that this character has joined; otherwise nil, the
--- due channels it hasn't joined and when the next ad is due.
-function ns.DueAd(now)
+-- The configured channels whose interval has passed and that this character has joined ({ key, slot, position }
+-- each), the due ones it hasn't joined, and when the next ad is due.
+function ns.DueAds(now)
 	local db = ns.db
+	local due, unjoined, nextDue = {}, {}, nil
 	if #db.ads == 0 then
-		return nil, nil, {}
+		return due, unjoined
 	end
-	local unjoined, nextDue = {}, nil
-	for _, key in ipairs(db.channels) do
-		local due = (db.lastAd[key] or 0) + db.adMinutes * 60
-		if now >= due then
+	for position, key in ipairs(db.channels) do
+		local at = (db.lastAd[key] or 0) + db.adMinutes * 60
+		if now >= at then
 			local slot = ns.ChannelSlot(key)
 			if slot then
-				return key, slot
+				due[#due + 1] = { key = key, slot = slot, position = position }
+			else
+				unjoined[#unjoined + 1] = key
 			end
-			unjoined[#unjoined + 1] = key
 		else
-			nextDue = math.min(nextDue or due, due)
+			nextDue = math.min(nextDue or at, at)
 		end
 	end
-	return nil, nil, unjoined, nextDue
+	return due, unjoined, nextDue
 end
 
 function ns.AnyAdFits()
@@ -129,21 +144,24 @@ function ns.AnyAdFits()
 	return false
 end
 
-local function NextAdText()
+-- Each channel goes through every text in turn, starting one further along than the channel before it, so one
+-- press's ads differ from each other.
+local function NextAdText(key, position)
 	local db = ns.db
 	for _ = 1, #db.ads do
-		local index = (db.nextAd - 1) % #db.ads + 1
-		db.nextAd = index % #db.ads + 1
+		local index = ((db.nextAdFor[key] or position) - 1) % #db.ads + 1
+		db.nextAdFor[key] = index % #db.ads + 1
 		local text = ns.Expand(db.ads[index])
 		if #text <= ns.MAX_BYTES then
 			return text
 		end
-		ns.Print(("ad %d: %s /gr ad set %d <text> shortens it."):format(index, ns.TooLongMessage(#text), index))
+		ns.Tell(("ad %d: %s /gr ad set %d <text> shortens it."):format(index, ns.TooLongMessage(#text), index),
+			NOTE_REPEAT)
 	end
 end
 
-function ns.PostAd(key, slot)
-	local text = NextAdText()
+function ns.PostAd(key, slot, position)
+	local text = NextAdText(key, position or 1)
 	if not text then
 		return
 	end
@@ -151,5 +169,6 @@ function ns.PostAd(key, slot)
 	C_ChatInfo.SendChatMessage(text, "CHANNEL", nil, slot)
 	ns.db.lastAd[key], ns.db.lastAdAny = now, now
 	ns.db.stats.ads = ns.db.stats.ads + 1
+	posted[slot] = { text = text, key = key }
 	ns.Log("ad", key, slot)
 end

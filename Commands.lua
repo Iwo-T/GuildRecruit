@@ -1,10 +1,12 @@
 local _, ns = ...
 
 local HELP = {
-	"/gr next - the next recruiting step (also a key binding: Key Bindings > AddOns > GuildRecruit, or a macro).",
+	"/gr next - posts the due ads, checks a candidate and invites who asked (also a key binding: Key Bindings > "
+		.. "AddOns > GuildRecruit; in a macro you press often, /gr next quiet).",
 	"/gr show - the window; /gr list - the people found; /gr invite <name>; /gr skip <name>.",
+	"/gr whisper <name> - whispers them the guild's pitch now; /gr auto on|off - whispers on their own or on a press.",
 	"/gr ads - the ad texts; /gr ad add <text> | ad set <n> <text> | ad del <n> | ad reset ({guild} is the guild).",
-	"/gr whisper [<text> | reset] - the whisper to Danish speakers without a guild ({name} is their first name).",
+	"/gr whispertext [<text> | reset] - the whisper's text ({name} is their first name).",
 	"/gr channels; /gr channel add|del <name> - where ads go; /gr interval <minutes>; /gr watch on|off.",
 }
 
@@ -20,6 +22,9 @@ local function Status()
 	ns.Print(ns.StatusLine() .. ".")
 	if not ns.db.watching then
 		ns.Print("chat watching is off: /gr watch on starts it again.")
+	end
+	if not ns.db.autoWhisper then
+		ns.Print("whispers wait for a press: /gr auto on sends them on their own.")
 	end
 	if C_ClubFinder and C_ClubFinder.IsEnabled and C_ClubFinder.IsEnabled() then
 		ns.Print("the Guild Finder works here: list the guild there too (Guild & Communities > Guild Finder).")
@@ -110,27 +115,78 @@ local function EditAd(rest)
 			ns.Print("/gr ad del <n>, with n from /gr ads.")
 		else
 			table.remove(ads, index)
-			ns.db.nextAd = 1
+			ns.db.nextAdFor = {}
 			ns.Print(("ad %d deleted."):format(index))
 		end
 	elseif action == "reset" then
-		ns.db.ads, ns.db.nextAd = CopyTable(ns.DEFAULT_ADS), 1
+		ns.db.ads, ns.db.nextAdFor = CopyTable(ns.DEFAULT_ADS), {}
 		ns.Print("the default ad texts are back.")
 	else
 		ns.Print("/gr ad add <text> | ad set <n> <text> | ad del <n> | ad reset")
 	end
 end
 
+-- A new text may fit people the old one didn't: they're named again if it still doesn't, and whispers resume.
+local function UseWhisper(text, message)
+	ns.db.whisper = text
+	for _, person in pairs(ns.db.people) do
+		person.tooLong = nil
+	end
+	ns.Print(message)
+	ns.AutoWhisper()
+end
+
 local function EditWhisper(rest)
 	if rest == "" then
 		ns.Print("the whisper: " .. ns.db.whisper)
 	elseif rest:lower() == "reset" then
-		ns.db.whisper = ns.DEFAULT_WHISPER
-		ns.Print("the default whisper is back.")
+		UseWhisper(ns.DEFAULT_WHISPER, "the default whisper is back.")
 	elseif Fits(rest) then
-		ns.db.whisper = rest
-		ns.Print("whisper set.")
+		UseWhisper(rest, "whisper set.")
 	end
+end
+
+-- A character name is a first name and a surname, perhaps with a realm: more words, or a {placeholder}, is a text.
+local MAX_NAME_WORDS = 2
+
+local function LooksLikeText(input)
+	local words = 0
+	for _ in input:gmatch("%S+") do
+		words = words + 1
+	end
+	return words > MAX_NAME_WORDS or input:find("{", 1, true) ~= nil
+end
+
+local function WhisperName(name)
+	if name == "" then
+		ns.Print("/gr whisper <name> whispers them now: " .. ns.db.whisper)
+	elseif LooksLikeText(name) then
+		ns.Print("that looks like a text, not a name: /gr whispertext <text> sets the whisper.")
+	elseif ns.IsGuildMember(name) then
+		ns.Print(name .. " is already in your guild.")
+	elseif ns.ChatLocked() then
+		ns.Print("chat is locked during this fight, so their answer couldn't be read: try again after it.")
+	elseif not ns.GuildTag() then
+		ns.Print("the guild's name hasn't loaded yet: try again in a moment.")
+	else
+		local person = FindOrAdd(name)
+		local text = ns.Expand(ns.db.whisper, ns.FirstName(person.name))
+		if #text > ns.MAX_BYTES then
+			ns.Print(ns.TooLongMessage(#text))
+		else
+			ns.Whisper(person, text)
+			ns.Print("whispered " .. person.name .. ".")
+		end
+	end
+end
+
+local function SetAuto(rest)
+	local value = rest:lower()
+	if value == "on" or value == "off" then
+		ns.db.autoWhisper = value == "on"
+	end
+	ns.Print(ns.db.autoWhisper and "whispers go out on their own." or "whispers wait for a press.")
+	ns.AutoWhisper()
 end
 
 local function ListChannels()
@@ -194,7 +250,7 @@ local function SetWatching(rest)
 end
 
 local COMMANDS = {
-	next = function() ns.DoNext() end,
+	next = function(rest) ns.DoNext(rest:lower() == "quiet") end,
 	show = function() ns.ShowWindow(true) end,
 	hide = function() ns.ShowWindow(false) end,
 	toggle = function() ns.ShowWindow() end,
@@ -203,7 +259,9 @@ local COMMANDS = {
 	skip = SkipName,
 	ads = ListAds,
 	ad = EditAd,
-	whisper = EditWhisper,
+	whisper = WhisperName,
+	whispertext = EditWhisper,
+	auto = SetAuto,
 	channels = ListChannels,
 	channel = EditChannels,
 	interval = SetInterval,
